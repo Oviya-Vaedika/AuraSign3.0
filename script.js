@@ -1,34 +1,43 @@
 
 "use strict";
 
-// ============================================================
-// AURA SIGN
-// Local camera tracking — no API keys or backend API calls.
-// MediaPipe Hands must be loaded by index.html.
-// ============================================================
+/*
+ * AURA SIGN — LOCAL FRONTEND
+ * No backend API calls and no API key.
+ *
+ * Features:
+ * - Text input, examples, copy, clear and speech
+ * - Browser-local text-to-fingerspelling output
+ * - Camera hand tracking using MediaPipe Hands
+ * - Hand landmark overlay
+ * - Camera start/stop controls
+ * - Three.js idle avatar
+ *
+ * NOTE:
+ * Landmark tracking alone is not a trained ISL recognition model.
+ */
 
 const $ = (id) => document.getElementById(id);
 
-let toastTimer = null;
+let toastTimer;
 let cameraStream = null;
 let handsModel = null;
 let cameraRunning = false;
 let processingFrame = false;
+let lastDetection = "";
 let animationFrameId = null;
-let lastPose = "";
-let lastPoseTime = 0;
-let modelInitializing = false;
 
-// ------------------------------------------------------------
-// GENERAL HELPERS
-// ------------------------------------------------------------
+let threeRenderer = null;
+let threeScene = null;
+let threeCamera = null;
+let avatarGroup = null;
+let resizeObserver = null;
+
+const NO_RECOGNITION = "No sign recognised yet.";
 
 function showToast(message) {
   const toast = $("toast");
-  if (!toast) {
-    console.log(message);
-    return;
-  }
+  if (!toast) return;
 
   toast.textContent = message;
   toast.classList.add("show");
@@ -40,29 +49,21 @@ function showToast(message) {
 }
 
 function setResult(text, note = "") {
-  const result = $("resultText");
-  const resultNote = $("resultNote");
-
-  if (result) result.textContent = text;
-  if (resultNote) resultNote.textContent = note;
+  if ($("resultText")) $("resultText").textContent = text;
+  if ($("resultNote")) $("resultNote").textContent = note;
 }
 
-function detectionStatus(title, message) {
-  const titleElement = $("detectionTitle");
-  const messageElement = $("detectionMessage");
-
-  if (titleElement) titleElement.textContent = title;
-  if (messageElement) messageElement.textContent = message;
+function setTextIfPresent(id, text) {
+  const element = $(id);
+  if (element) element.textContent = text;
 }
 
-function setModeStatus(message) {
-  const element = $("modeStatus");
-  if (element) element.textContent = message;
+function setDisabled(id, disabled) {
+  const element = $(id);
+  if (element) element.disabled = disabled;
 }
 
-// ------------------------------------------------------------
-// MODE SWITCHING
-// ------------------------------------------------------------
+/* ---------------- MODE SWITCHING ---------------- */
 
 function setMode(mode) {
   const textMode = mode === "text";
@@ -77,35 +78,25 @@ function setMode(mode) {
   $("cameraSection")?.classList.toggle("hidden", textMode);
   $("avatarPanel")?.classList.toggle("hidden", !textMode);
 
-  const heading = $("inputHeading");
-  if (heading) {
-    heading.textContent = textMode ? "Text to sign" : "Sign to text";
-  }
+  setTextIfPresent("inputHeading", textMode ? "Text to sign" : "Sign to text");
+  setTextIfPresent("modeStatus", textMode ? "TEXT MODE" : "CAMERA MODE");
 
-  setModeStatus(textMode ? "TEXT MODE" : "CAMERA MODE");
-
-  if (textMode) {
+  if (!textMode) {
     stopCamera();
-    if ($("avatarMode")) $("avatarMode").textContent = "IDLE MODE";
-  } else {
-    startCamera();
+    setTextIfPresent("avatarMode", "IDLE MODE");
   }
 }
 
 $("textTab")?.addEventListener("click", () => setMode("text"));
 $("cameraTab")?.addEventListener("click", () => setMode("camera"));
 
-// ------------------------------------------------------------
-// TEXT INPUT
-// ------------------------------------------------------------
+/* ---------------- TEXT INPUT ---------------- */
 
 function updateCharacterCount() {
   const input = $("textInput");
-  const count = $("charCount");
+  if (!input) return;
 
-  if (input && count) {
-    count.textContent = `${input.value.length} / 500`;
-  }
+  setTextIfPresent("charCount", `${input.value.length} / 500`);
 }
 
 $("textInput")?.addEventListener("input", updateCharacterCount);
@@ -117,90 +108,87 @@ document.querySelectorAll("[data-example]").forEach((button) => {
 
     input.value = button.dataset.example || "";
     updateCharacterCount();
+    input.focus();
   });
 });
 
-// ------------------------------------------------------------
-// LOCAL TEXT HANDLING
-//
-// This does not generate sign-language translations or
-// verified sign animations. It provides a local text preview.
-// ------------------------------------------------------------
+/*
+ * Local fingerspelling output.
+ * This displays the letters of the typed message.
+ * It does NOT claim that English fingerspelling is a complete ISL translation.
+ */
+function makeLocalFingerspelling(text) {
+  const cleaned = text
+    .toUpperCase()
+    .replace(/[^A-Z0-9 .,?!']/g, "");
+
+  if (!cleaned) return "";
+
+  return cleaned
+    .split("")
+    .map((character) => {
+      if (character === " ") return "/";
+      if (character === ",") return ",";
+      if (character === ".") return ".";
+      if (character === "?") return "?";
+      if (character === "!") return "!";
+      if (character === "'") return "'";
+      return character;
+    })
+    .join(" ");
+}
 
 $("translateButton")?.addEventListener("click", () => {
   const input = $("textInput");
-  if (!input) return;
-
-  const text = input.value.trim();
+  const text = input?.value.trim() || "";
 
   if (!text) {
     showToast("Enter a message first.");
-    input.focus();
+    input?.focus();
     return;
   }
 
-  const language = $("languageSelect")?.value || "ISL";
-  const characters = [...text.toUpperCase()]
-    .filter((character) => /[A-Z0-9]/.test(character));
+  if (text.length > 500) {
+    showToast("Please keep your message within 500 characters.");
+    return;
+  }
+
+  const output = makeLocalFingerspelling(text);
 
   setResult(
-    text,
-    `Local preview only. Selected mode: ${language}. ` +
-    `${characters.length} letters/numbers can be examined individually. ` +
-    "This is not a sign-language translation; verified sign animations " +
-    "are not connected."
+    output,
+    "Local fingerspelling preview only. This is not a verified ISL sentence translation or animated sign sequence."
   );
 
-  setModeStatus("LOCAL PREVIEW");
-});
+  setTextIfPresent("modeStatus", "LOCAL PREVIEW");
+  setTextIfPresent("avatarMode", "IDLE PREVIEW");
 
-// ------------------------------------------------------------
-// COPY RESULT
-// ------------------------------------------------------------
+  showToast("Local fingerspelling preview created.");
+});
 
 $("copyButton")?.addEventListener("click", async () => {
   const text = $("resultText")?.textContent || "";
 
   try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const temporary = document.createElement("textarea");
-      temporary.value = text;
-      temporary.style.position = "fixed";
-      temporary.style.opacity = "0";
-
-      document.body.appendChild(temporary);
-      temporary.select();
-
-      const copied = document.execCommand("copy");
-      temporary.remove();
-
-      if (!copied) throw new Error("Copy unavailable");
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("Clipboard unavailable");
     }
 
+    await navigator.clipboard.writeText(text);
     showToast("Result copied.");
   } catch {
     showToast("Copy failed. Select the result and copy it manually.");
   }
 });
 
-// ------------------------------------------------------------
-// CLEAR RESULT
-// ------------------------------------------------------------
-
 $("clearButton")?.addEventListener("click", () => {
   setResult(
     "Enter a message and select Translate to Sign.",
-    "Local preview mode. Verified sign animations are not connected."
+    "Local fingerspelling preview; verified ISL animations are not connected."
   );
 
-  setModeStatus("READY");
+  setTextIfPresent("modeStatus", "TEXT MODE");
 });
-
-// ------------------------------------------------------------
-// SPEECH OUTPUT
-// ------------------------------------------------------------
 
 $("speakButton")?.addEventListener("click", () => {
   const text = $("resultText")?.textContent?.trim() || "";
@@ -213,27 +201,33 @@ $("speakButton")?.addEventListener("click", () => {
   window.speechSynthesis.cancel();
 
   const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = 0.9;
   window.speechSynthesis.speak(utterance);
 });
 
-// ------------------------------------------------------------
-// CAMERA OVERLAY
-// ------------------------------------------------------------
+/* ---------------- CAMERA STATUS ---------------- */
+
+function detectionStatus(title, message) {
+  setTextIfPresent("detectionTitle", title);
+  setTextIfPresent("detectionMessage", message);
+}
 
 function clearOverlay() {
   const canvas = $("cameraOverlay");
-  if (!canvas) return;
+  const ctx = canvas?.getContext("2d");
 
-  const ctx = canvas.getContext("2d");
-  if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (ctx && canvas) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
 }
 
 function drawLandmarks(points) {
   const video = $("cameraVideo");
   const canvas = $("cameraOverlay");
 
-  if (!video || !canvas || !points || points.length < 21) return;
-  if (!video.videoWidth || !video.videoHeight) return;
+  if (!video || !canvas || !video.videoWidth || !video.videoHeight) {
+    return;
+  }
 
   if (
     canvas.width !== video.videoWidth ||
@@ -248,7 +242,7 @@ function drawLandmarks(points) {
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  // Mirror the overlay to match a mirrored camera preview.
+  // Mirror the skeleton so it matches a selfie-style camera preview.
   ctx.save();
   ctx.translate(canvas.width, 0);
   ctx.scale(-1, 1);
@@ -267,6 +261,8 @@ function drawLandmarks(points) {
   ];
 
   for (const [a, b] of connections) {
+    if (!points[a] || !points[b]) continue;
+
     ctx.beginPath();
     ctx.moveTo(
       points[a].x * canvas.width,
@@ -294,293 +290,164 @@ function drawLandmarks(points) {
   ctx.restore();
 }
 
-// ------------------------------------------------------------
-// FINGER-POSE ESTIMATION
-//
-// MediaPipe landmark indices:
-// Thumb: 1-4
-// Index: 5-8
-// Middle: 9-12
-// Ring: 13-16
-// Little: 17-20
-//
-// These are approximate visual rules, NOT an ISL classifier.
-// ------------------------------------------------------------
+/* ---------------- MEDIAPIPE HAND TRACKING ---------------- */
 
-function distance3D(a, b) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  const dz = (a.z || 0) - (b.z || 0);
+async function initialiseHandDetector() {
+  if (handsModel) return handsModel;
 
-  return Math.sqrt(dx * dx + dy * dy + dz * dz);
-}
+  if (typeof window.Hands === "undefined") {
+    throw new Error(
+      "MediaPipe Hands did not load. Check the library script in index.html and refresh."
+    );
+  }
 
-function estimateFingerStates(points) {
-  if (!points || points.length < 21) return null;
+  handsModel = new window.Hands({
+    locateFile: (file) =>
+      `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
 
-  // Finger extension is estimated using fingertip distance
-  // from the wrist, compared with the middle joint.
-  // This is more tolerant of camera tilt than checking y alone.
-  const wrist = points[0];
+  handsModel.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.65
+  });
 
-  const fingers = [
-    { name: "Thumb", tip: 4, middle: 2, base: 5 },
-    { name: "Index", tip: 8, middle: 6, base: 5 },
-    { name: "Middle", tip: 12, middle: 10, base: 9 },
-    { name: "Ring", tip: 16, middle: 14, base: 13 },
-    { name: "Little", tip: 20, middle: 18, base: 17 }
-  ];
+  handsModel.onResults((results) => {
+    const hands = results.multiHandLandmarks || [];
+    const points = hands[0];
 
-  const states = {};
+    if (points) {
+      drawLandmarks(points);
 
-  for (const finger of fingers) {
-    const tipDistance = distance3D(points[finger.tip], wrist);
-    const jointDistance = distance3D(points[finger.middle], wrist);
+      const handCount = hands.length;
+      setTextIfPresent("cameraLabel", `${handCount} HAND${handCount > 1 ? "S" : ""} TRACKED`);
 
-    if (finger.name === "Thumb") {
-      // Thumb orientation varies with hand rotation.
-      const thumbTip = points[4];
-      const thumbJoint = points[3];
-      const indexBase = points[5];
+      if (lastDetection !== "hand") {
+        detectionStatus(
+          "Hand detected",
+          "Landmarks are tracking. ISL letter recognition requires a validated ISL-trained classifier."
+        );
 
-      const thumbToIndex = distance3D(thumbTip, indexBase);
-      const thumbJointToIndex = distance3D(thumbJoint, indexBase);
+        if (
+          $("recognisedText") &&
+          $("recognisedText").textContent === NO_RECOGNITION
+        ) {
+          $("recognisedText").textContent = "Hand detected — tracking landmarks.";
+        }
 
-      states.Thumb =
-        thumbToIndex > thumbJointToIndex * 1.12;
+        lastDetection = "hand";
+      }
     } else {
-      states[finger.name] = tipDistance > jointDistance * 1.12;
+      clearOverlay();
+      setTextIfPresent("cameraLabel", "LOOKING FOR HAND");
+
+      if (lastDetection !== "none") {
+        detectionStatus(
+          "No hand detected",
+          "Keep your hand visible in the frame and try brighter, even lighting."
+        );
+        lastDetection = "none";
+      }
     }
-  }
+  });
 
-  return states;
+  return handsModel;
 }
 
-function describeFingerPose(states) {
-  if (!states) return "Hand landmarks unavailable";
+/* ---------------- CAMERA FRAME LOOP ---------------- */
 
-  const names = ["Thumb", "Index", "Middle", "Ring", "Little"];
-  const extended = names.filter((name) => states[name]);
-  const count = extended.length;
-
-  const pattern = names
-    .map((name) => states[name] ? "1" : "0")
-    .join("");
-
-  let description;
-
-  if (count === 5) {
-    description = "Open hand — approximately 5 fingers extended";
-  } else if (count === 0) {
-    description = "Closed-hand-like pose — few fingers extended";
-  } else {
-    description =
-      `${count} finger(s) appear extended: ` +
-      (extended.length ? extended.join(", ") : "none");
-  }
-
-  return { description, pattern, count, extended };
-}
-
-// ------------------------------------------------------------
-// PROCESS MEDIAPIPE RESULTS
-// ------------------------------------------------------------
-
-function handleHandResults(results) {
+async function frameLoop() {
   if (!cameraRunning) return;
 
   const video = $("cameraVideo");
-  const allHands = results.multiHandLandmarks || [];
 
-  if (!allHands.length) {
-    clearOverlay();
-    lastPose = "";
+  if (
+    !processingFrame &&
+    video &&
+    video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+    handsModel
+  ) {
+    processingFrame = true;
 
-    detectionStatus(
-      "No hand detected",
-      "Place one hand inside the camera frame with good lighting."
-    );
-
-    return;
-  }
-
-  // Draw every detected hand.
-  for (const landmarks of allHands) {
-    drawLandmarks(landmarks);
-  }
-
-  // Report the first hand only, avoiding duplicate output
-  // when two hands are visible.
-  const points = allHands[0];
-  const states = estimateFingerStates(points);
-  const pose = describeFingerPose(states);
-
-  if (!pose || typeof pose === "string") {
-    detectionStatus("Detecting hand", "Please hold your hand steady.");
-    return;
-  }
-
-  const now = performance.now();
-
-  if (pose.pattern !== lastPose || now - lastPoseTime > 1200) {
-    lastPose = pose.pattern;
-    lastPoseTime = now;
-
-    detectionStatus(
-      "Hand detected",
-      `${pose.description}. Pattern: ${pose.pattern}. ` +
-      "Experimental finger estimate — not an ISL letter prediction."
-    );
-
-    setResult(
-      pose.description,
-      `Finger pattern (Thumb, Index, Middle, Ring, Little): ` +
-      `${pose.pattern}. This experimental estimate is not a verified ` +
-      "ISL sign or alphabet translation."
-    );
-  }
-
-  if (video && video.readyState < 2) {
-    detectionStatus("Hand detected", "Preparing camera frame...");
-  }
-}
-
-// ------------------------------------------------------------
-// INITIALIZE MEDIAPIPE HANDS
-// ------------------------------------------------------------
-
-async function initializeHands() {
-  if (handsModel) return handsModel;
-
-  if (modelInitializing) {
-    throw new Error("Hand tracking is already initializing.");
-  }
-
-  modelInitializing = true;
-
-  try {
-    if (typeof window.Hands !== "function") {
-      throw new Error(
-        "MediaPipe Hands was not found. Check the MediaPipe script " +
-        "in index.html and reload the page."
+    try {
+      await handsModel.send({ image: video });
+    } catch (error) {
+      console.error("Hand tracking frame failed:", error);
+      detectionStatus(
+        "Tracking error",
+        "Could not process the camera frame. Try stopping and restarting the camera."
       );
+    } finally {
+      processingFrame = false;
     }
+  }
 
-    handsModel = new window.Hands({
-      locateFile: (file) =>
-        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-    });
-
-    handsModel.setOptions({
-      maxNumHands: 2,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.65,
-      minTrackingConfidence: 0.65
-    });
-
-    handsModel.onResults(handleHandResults);
-
-    return handsModel;
-  } catch (error) {
-    handsModel = null;
-    throw error;
-  } finally {
-    modelInitializing = false;
+  if (cameraRunning) {
+    animationFrameId = requestAnimationFrame(frameLoop);
   }
 }
 
-// ------------------------------------------------------------
-// CAMERA START / STOP
-// ------------------------------------------------------------
+/* ---------------- CAMERA START / STOP ---------------- */
 
-async function startCamera() {
+$("startCameraButton")?.addEventListener("click", async () => {
   if (cameraRunning) return;
 
-  const video = $("cameraVideo");
+  const button = $("startCameraButton");
+  if (button) button.disabled = true;
 
-  if (!video) {
-    showToast("Camera video element is missing from index.html.");
-    return;
-  }
-
-  if (!navigator.mediaDevices?.getUserMedia) {
-    detectionStatus(
-      "Camera unavailable",
-      "Use HTTPS or localhost and a browser that supports camera access."
-    );
-    showToast("Camera access is not supported here.");
-    return;
-  }
+  detectionStatus("Starting camera…", "Allow camera permission when prompted.");
 
   try {
-    detectionStatus("Starting camera", "Requesting camera permission...");
-    setModeStatus("STARTING CAMERA");
-
-    const model = await initializeHands();
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Camera access requires HTTPS or localhost.");
+    }
 
     cameraStream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
       video: {
         facingMode: "user",
         width: { ideal: 1280 },
         height: { ideal: 720 }
-      }
+      },
+      audio: false
     });
 
+    const video = $("cameraVideo");
+
+    if (!video) {
+      throw new Error("The cameraVideo element is missing from index.html.");
+    }
+
     video.srcObject = cameraStream;
-    video.playsInline = true;
     video.muted = true;
+    video.playsInline = true;
 
     await video.play();
+    await initialiseHandDetector();
 
     cameraRunning = true;
     processingFrame = false;
-    setModeStatus("CAMERA ACTIVE");
+    lastDetection = "";
+
+    setDisabled("stopCameraButton", false);
+    setTextIfPresent("cameraLabel", "CAMERA ACTIVE");
 
     detectionStatus(
       "Camera active",
-      "Show your hand clearly inside the frame."
+      "Looking for hands. Landmark tracking is active; sign recognition is not yet trained."
     );
 
-    async function processFrame() {
-      if (!cameraRunning) return;
-
-      if (
-        !processingFrame &&
-        video.readyState >= 2 &&
-        video.videoWidth > 0
-      ) {
-        processingFrame = true;
-
-        try {
-          await model.send({ image: video });
-        } catch (error) {
-          console.error("Hand tracking frame error:", error);
-        } finally {
-          processingFrame = false;
-        }
-      }
-
-      if (cameraRunning) {
-        animationFrameId = requestAnimationFrame(processFrame);
-      }
-    }
-
-    animationFrameId = requestAnimationFrame(processFrame);
+    frameLoop();
   } catch (error) {
-    console.error("Aura Sign camera error:", error);
-
+    console.error("Camera startup failed:", error);
     stopCamera();
 
-    detectionStatus(
-      "Camera could not start",
-      error.message || "Check camera permission and try again."
-    );
-
-    setModeStatus("CAMERA ERROR");
+    detectionStatus("Camera unavailable", error.message || "Could not start the camera.");
     showToast(error.message || "Could not start the camera.");
+  } finally {
+    if (button) button.disabled = cameraRunning;
   }
-}
+});
 
 function stopCamera() {
   cameraRunning = false;
@@ -592,9 +459,7 @@ function stopCamera() {
   }
 
   if (cameraStream) {
-    for (const track of cameraStream.getTracks()) {
-      track.stop();
-    }
+    cameraStream.getTracks().forEach((track) => track.stop());
     cameraStream = null;
   }
 
@@ -607,49 +472,277 @@ function stopCamera() {
 
   clearOverlay();
 
-  lastPose = "";
-  lastPoseTime = 0;
+  setTextIfPresent("cameraLabel", "CAMERA OFF");
+  setDisabled("startCameraButton", false);
+  setDisabled("stopCameraButton", true);
+
+  lastDetection = "";
 }
 
-// ------------------------------------------------------------
-// OPTIONAL CAMERA BUTTONS
-//
-// These handlers are attached only when matching elements exist.
-// ------------------------------------------------------------
-
-[
-  "startCameraButton",
-  "startCamera",
-  "enableCameraButton"
-].forEach((id) => {
-  $(id)?.addEventListener("click", startCamera);
+$("stopCameraButton")?.addEventListener("click", () => {
+  stopCamera();
+  detectionStatus("Camera stopped", "Start the camera whenever you are ready.");
 });
 
-[
-  "stopCameraButton",
-  "stopCamera",
-  "disableCameraButton"
-].forEach((id) => {
-  $(id)?.addEventListener("click", stopCamera);
+$("clearRecognisedButton")?.addEventListener("click", () => {
+  setTextIfPresent("recognisedText", NO_RECOGNITION);
 });
 
-// ------------------------------------------------------------
-// CLEANUP
-// ------------------------------------------------------------
+$("speakRecognisedButton")?.addEventListener("click", () => {
+  const text = $("recognisedText")?.textContent?.trim() || "";
+
+  if (!text || text === NO_RECOGNITION) {
+    showToast("There is no recognised text to speak.");
+    return;
+  }
+
+  if (!("speechSynthesis" in window)) {
+    showToast("Speech is not available in this browser.");
+    return;
+  }
+
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+});
 
 window.addEventListener("pagehide", stopCamera);
 
-// Initial page state
+/* ---------------- 3D AVATAR PREVIEW ---------------- */
+
+function createPart(parent, geometry, material, position, scale) {
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.set(...position);
+
+  if (scale) {
+    mesh.scale.set(...scale);
+  }
+
+  parent.add(mesh);
+  return mesh;
+}
+
+function createAvatar() {
+  const fallback = $("avatarFallback");
+  const canvas = $("avatarCanvas");
+
+  if (!canvas || !window.THREE) {
+    if (fallback) {
+      fallback.textContent =
+        "3D preview unavailable. Check that Three.js is loaded in index.html.";
+    }
+    return;
+  }
+
+  try {
+    threeScene = new THREE.Scene();
+    threeScene.background = new THREE.Color("#0c1020");
+
+    threeCamera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
+    threeCamera.position.set(0, 1.25, 5.5);
+    threeCamera.lookAt(0, 1.1, 0);
+
+    threeRenderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      alpha: true
+    });
+
+    threeRenderer.setPixelRatio(
+      Math.min(window.devicePixelRatio || 1, 2)
+    );
+
+    threeScene.add(
+      new THREE.HemisphereLight(0xe3eaff, 0x24133f, 2)
+    );
+
+    const mainLight = new THREE.DirectionalLight(0xffffff, 2.5);
+    mainLight.position.set(3, 5, 4);
+    threeScene.add(mainLight);
+
+    const rimLight = new THREE.PointLight(0x22d3ee, 18, 10);
+    rimLight.position.set(-2, 2, -2);
+    threeScene.add(rimLight);
+
+    avatarGroup = new THREE.Group();
+    threeScene.add(avatarGroup);
+
+    const material = (color) =>
+      new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.65
+      });
+
+    const skin = material("#d89b7c");
+    const hair = material("#20182f");
+    const shirt = material("#6550c9");
+    const sleeve = material("#8b5cf6");
+    const pants = material("#25324f");
+    const dark = material("#171426");
+
+    createPart(
+      avatarGroup,
+      new THREE.CapsuleGeometry(0.42, 0.58, 5, 12),
+      shirt,
+      [0, 1.12, 0],
+      [1, 1, 0.75]
+    );
+
+    createPart(
+      avatarGroup,
+      new THREE.CylinderGeometry(0.12, 0.13, 0.22, 16),
+      skin,
+      [0, 1.67, 0]
+    );
+
+    createPart(
+      avatarGroup,
+      new THREE.SphereGeometry(0.37, 24, 20),
+      skin,
+      [0, 2.02, 0]
+    );
+
+    createPart(
+      avatarGroup,
+      new THREE.SphereGeometry(0.375, 24, 18),
+      hair,
+      [0, 2.22, -0.035],
+      [1.02, 0.65, 0.98]
+    );
+
+    createPart(
+      avatarGroup,
+      new THREE.SphereGeometry(0.045, 12, 10),
+      dark,
+      [-0.125, 2.04, 0.327]
+    );
+
+    createPart(
+      avatarGroup,
+      new THREE.SphereGeometry(0.045, 12, 10),
+      dark,
+      [0.125, 2.04, 0.327]
+    );
+
+    const leftArm = new THREE.Group();
+    leftArm.position.set(-0.42, 1.42, 0);
+    avatarGroup.add(leftArm);
+
+    createPart(
+      leftArm,
+      new THREE.CapsuleGeometry(0.105, 0.36, 4, 10),
+      sleeve,
+      [0, -0.24, 0]
+    );
+
+    createPart(
+      leftArm,
+      new THREE.SphereGeometry(0.11, 14, 12),
+      skin,
+      [0, -0.52, 0.03]
+    );
+
+    const rightArm = new THREE.Group();
+    rightArm.position.set(0.42, 1.42, 0);
+    avatarGroup.add(rightArm);
+
+    createPart(
+      rightArm,
+      new THREE.CapsuleGeometry(0.105, 0.36, 4, 10),
+      sleeve,
+      [0, -0.24, 0]
+    );
+
+    createPart(
+      rightArm,
+      new THREE.SphereGeometry(0.11, 14, 12),
+      skin,
+      [0, -0.52, 0.03]
+    );
+
+    createPart(
+      avatarGroup,
+      new THREE.CapsuleGeometry(0.16, 0.5, 4, 10),
+      pants,
+      [-0.19, 0.35, 0]
+    );
+
+    createPart(
+      avatarGroup,
+      new THREE.CapsuleGeometry(0.16, 0.5, 4, 10),
+      pants,
+      [0.19, 0.35, 0]
+    );
+
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(0.8, 0.012, 8, 80),
+      new THREE.MeshBasicMaterial({ color: 0x22d3ee })
+    );
+
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = -0.04;
+    ring.scale.set(1.15, 1, 1);
+    avatarGroup.add(ring);
+
+    fallback?.classList.add("hidden");
+
+    function resizeAvatar() {
+      const width = canvas.clientWidth || 500;
+      const height = canvas.clientHeight || 350;
+
+      threeRenderer.setSize(width, height, false);
+      threeCamera.aspect = width / height;
+      threeCamera.updateProjectionMatrix();
+    }
+
+    resizeAvatar();
+
+    if ("ResizeObserver" in window && $("avatarStage")) {
+      resizeObserver = new ResizeObserver(resizeAvatar);
+      resizeObserver.observe($("avatarStage"));
+    } else {
+      window.addEventListener("resize", resizeAvatar);
+    }
+
+    function animateAvatar() {
+      requestAnimationFrame(animateAvatar);
+
+      if (!avatarGroup || !threeRenderer || !threeScene || !threeCamera) {
+        return;
+      }
+
+      const time = performance.now() / 1000;
+
+      avatarGroup.position.y = Math.sin(time * 1.2) * 0.025;
+      avatarGroup.rotation.y = Math.sin(time * 0.4) * 0.1;
+
+      threeRenderer.render(threeScene, threeCamera);
+    }
+
+    animateAvatar();
+  } catch (error) {
+    console.error("Avatar startup failed:", error);
+
+    fallback?.classList.remove("hidden");
+
+    if (fallback) {
+      fallback.textContent =
+        "The 3D avatar could not load. Check the Three.js script and refresh.";
+    }
+  }
+}
+
+createAvatar();
+
+/* ---------------- INITIAL PAGE STATE ---------------- */
+
 updateCharacterCount();
+setDisabled("stopCameraButton", true);
+
+if ($("recognisedText") && !$("recognisedText").textContent.trim()) {
+  $("recognisedText").textContent = NO_RECOGNITION;
+}
 
 setResult(
   "Enter a message and select Translate to Sign.",
-  "Local preview mode. Verified sign animations are not connected."
+  "Local fingerspelling preview only. Verified ISL translation and signing animations are not connected."
 );
-
-detectionStatus(
-  "Camera ready",
-  "Switch to camera mode to start hand tracking."
-);
-
-setModeStatus("READY");
